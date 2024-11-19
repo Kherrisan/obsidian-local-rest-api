@@ -9,6 +9,7 @@ import {
 } from "obsidian";
 import periodicNotes from "obsidian-daily-notes-interface";
 import { getAPI as getDataviewAPI } from "obsidian-dataview";
+import forge from "node-forge";
 
 import express from "express";
 import http from "http";
@@ -20,6 +21,13 @@ import responseTime from "response-time";
 import queryString from "query-string";
 import WildcardRegexp from "glob-to-regexp";
 import path from "path";
+import {
+  applyPatch,
+  ContentType,
+  PatchInstruction,
+  PatchOperation,
+  PatchTargetType,
+} from "markdown-patch";
 
 import {
   CannedResponse,
@@ -32,19 +40,32 @@ import {
   SearchJsonResponseItem,
   SearchResponseItem,
 } from "./types";
-import { findHeadingBoundary, getSplicePosition } from "./utils";
+import {
+  findHeadingBoundary,
+  getCertificateIsUptoStandards,
+  getCertificateValidityDays,
+  getSplicePosition,
+  toArrayBuffer,
+} from "./utils";
 import {
   CERT_NAME,
   ContentTypes,
   ERROR_CODE_MESSAGES,
   MaximumRequestSize,
 } from "./constants";
+import LocalRestApiPublicApi from "./api";
 
 export default class RequestHandler {
   app: App;
   api: express.Express;
   manifest: PluginManifest;
   settings: LocalRestApiSettings;
+
+  apiExtensionRouter: express.Router;
+  apiExtensions: {
+    manifest: PluginManifest;
+    api: LocalRestApiPublicApi;
+  }[] = [];
 
   constructor(
     app: App,
@@ -55,6 +76,8 @@ export default class RequestHandler {
     this.manifest = manifest;
     this.api = express();
     this.settings = settings;
+
+    this.apiExtensionRouter = express.Router();
 
     this.api.set("json spaces", 2);
 
@@ -78,6 +101,37 @@ export default class RequestHandler {
         return false;
       }
     );
+  }
+
+  registerApiExtension(manifest: PluginManifest): LocalRestApiPublicApi {
+    let api: LocalRestApiPublicApi | undefined = undefined;
+    for (const { manifest: existingManifest, api: existingApi } of this
+      .apiExtensions) {
+      if (JSON.stringify(existingManifest) === JSON.stringify(manifest)) {
+        api = existingApi;
+        break;
+      }
+    }
+    if (!api) {
+      const router = express.Router();
+      this.apiExtensionRouter.use(router);
+      api = new LocalRestApiPublicApi(router, () => {
+        const idx = this.apiExtensions.findIndex(
+          ({ manifest: storedManifest }) =>
+            JSON.stringify(manifest) === JSON.stringify(storedManifest)
+        );
+        if (idx !== -1) {
+          this.apiExtensions.splice(idx, 1);
+          this.apiExtensionRouter.stack.splice(idx, 1);
+        }
+      });
+      this.apiExtensions.push({
+        manifest,
+        api,
+      });
+    }
+
+    return api;
   }
 
   requestIsAuthenticated(req: express.Request): boolean {
@@ -120,12 +174,18 @@ export default class RequestHandler {
 
     // Gather both in-line tags (hash'd) & frontmatter tags; strip
     // leading '#' from them if it's there, and remove duplicates
-    const directTags = (cache.tags ?? []).map((tag) => tag.tag) ?? [];
+    const directTags =
+      (cache.tags ?? []).filter((tag) => tag).map((tag) => tag.tag) ?? [];
     const frontmatterTags = Array.isArray(frontmatter.tags)
       ? frontmatter.tags
       : [];
     const filteredTags: string[] = [...frontmatterTags, ...directTags]
-      .map((tag) => tag.replace(/^#/, ""))
+      // Filter out falsy tags
+      .filter((tag) => tag)
+      // Strip leading hash and get tag's string representation --
+      // although it should always be a string, it apparently isn't always!
+      .map((tag) => tag.toString().replace(/^#/, ""))
+      // Remove duplicates
       .filter((value, index, self) => self.indexOf(value) === index);
 
     return {
@@ -175,14 +235,33 @@ export default class RequestHandler {
   }
 
   root(req: express.Request, res: express.Response): void {
+    let certificate: forge.pki.Certificate | undefined;
+    try {
+      certificate = forge.pki.certificateFromPem(this.settings.crypto.cert);
+    } catch (e) {
+      // This is fine, we just won't include that in the output
+    }
+
     res.status(200).json({
       status: "OK",
+      manifest: this.manifest,
       versions: {
         obsidian: apiVersion,
         self: this.manifest.version,
       },
       service: "Obsidian Local REST API",
       authenticated: this.requestIsAuthenticated(req),
+      certificateInfo:
+        this.requestIsAuthenticated(req) && certificate
+          ? {
+              validityDays: getCertificateValidityDays(certificate),
+              regenerateRecommended:
+                !getCertificateIsUptoStandards(certificate),
+            }
+          : undefined,
+      apiExtensions: this.requestIsAuthenticated(req)
+        ? this.apiExtensions.map(({ manifest }) => manifest)
+        : undefined,
     });
   }
 
@@ -253,7 +332,9 @@ export default class RequestHandler {
   }
 
   async vaultGet(req: express.Request, res: express.Response): Promise<void> {
-    const path = req.params[0];
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1)
+    );
 
     return this._vaultGet(path, req, res);
   }
@@ -270,32 +351,34 @@ export default class RequestHandler {
       return;
     }
 
-    if (typeof req.body != "string") {
-      this.returnCannedResponse(res, {
-        errorCode: ErrorCode.TextOrByteContentEncodingRequired,
-      });
-      return;
-    }
-
     try {
       await this.app.vault.createFolder(path.dirname(filepath));
     } catch {
       // the folder/file already exists, but we don't care
     }
 
-    await this.app.vault.adapter.write(filepath, req.body);
+    if (typeof req.body === "string") {
+      await this.app.vault.adapter.write(filepath, req.body);
+    } else {
+      await this.app.vault.adapter.writeBinary(
+        filepath,
+        toArrayBuffer(req.body)
+      );
+    }
 
     this.returnCannedResponse(res, { statusCode: 204 });
     return;
   }
 
   async vaultPut(req: express.Request, res: express.Response): Promise<void> {
-    const path = req.params[0];
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1)
+    );
 
     return this._vaultPut(path, req, res);
   }
 
-  async _vaultPatch(
+  async _vaultPatchV2(
     path: string,
     req: express.Request,
     res: express.Response
@@ -308,12 +391,6 @@ export default class RequestHandler {
     let insert = false;
     let aboveNewLine = false;
 
-    if (!path || path.endsWith("/")) {
-      this.returnCannedResponse(res, {
-        errorCode: ErrorCode.RequestMethodValidOnlyForFiles,
-      });
-      return;
-    }
     if (contentPosition === undefined) {
       insert = false;
     } else if (contentPosition === "beginning") {
@@ -328,7 +405,7 @@ export default class RequestHandler {
     }
     if (typeof req.body != "string") {
       this.returnCannedResponse(res, {
-        errorCode: ErrorCode.TextOrByteContentEncodingRequired,
+        errorCode: ErrorCode.TextContentEncodingRequired,
       });
       return;
     }
@@ -378,11 +455,117 @@ export default class RequestHandler {
 
     await this.app.vault.adapter.write(path, content);
 
-    res.status(200).send(content);
+    console.warn(
+      `2.x PATCH implementation is deprecated and will be removed in version 4.0`
+    );
+    res
+      .header("Deprecation", 'true; sunset-version="4.0"')
+      .header(
+        "Link",
+        '<https://github.com/coddingtonbear/obsidian-local-rest-api/wiki/Changes-to-PATCH-requests-between-versions-2.0-and-3.0>; rel="alternate"'
+      )
+      .status(200)
+      .send(content);
+  }
+
+  async _vaultPatchV3(
+    path: string,
+    req: express.Request,
+    res: express.Response
+  ): Promise<void> {
+    const operation = req.get("Operation");
+    const targetType = req.get("Target-Type");
+    const rawTarget = decodeURIComponent(req.get("Target"));
+    const contentType = req.get("Content-Type");
+    const createTargetIfMissing = req.get("Create-Target-If-Missing") == "true";
+    const applyIfContentPreexists =
+      req.get("Apply-If-Content-Preexists") == "true";
+    const trimTargetWhitespace = req.get("Trim-Target-Whitespace") == "true";
+    const targetDelimiter = req.get("Target-Delimiter") || "::";
+
+    const target =
+      targetType == "heading" ? rawTarget.split(targetDelimiter) : rawTarget;
+
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      this.returnCannedResponse(res, {
+        statusCode: 404,
+      });
+      return;
+    }
+    const fileContents = await this.app.vault.read(file);
+
+    if (!targetType) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.MissingTargetTypeHeader,
+      });
+      return;
+    }
+    if (!["heading", "block", "frontmatter"].includes(targetType)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidTargetTypeHeader,
+      });
+      return;
+    }
+    if (!operation) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.MissingOperation,
+      });
+      return;
+    }
+    if (!["append", "prepend", "replace"].includes(operation)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidOperation,
+      });
+      return;
+    }
+    if (!path || path.endsWith("/")) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.RequestMethodValidOnlyForFiles,
+      });
+      return;
+    }
+
+    const instruction: PatchInstruction = {
+      operation: operation as PatchOperation,
+      targetType: targetType as PatchTargetType,
+      target,
+      contentType: contentType as ContentType,
+      content: req.body,
+      applyIfContentPreexists,
+      trimTargetWhitespace,
+      createTargetIfMissing,
+    } as PatchInstruction;
+
+    const patched = applyPatch(fileContents, instruction);
+
+    await this.app.vault.adapter.write(path, patched);
+
+    res.status(200).send(patched);
+  }
+
+  async _vaultPatch(
+    path: string,
+    req: express.Request,
+    res: express.Response
+  ): Promise<void> {
+    if (!path || path.endsWith("/")) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.RequestMethodValidOnlyForFiles,
+      });
+      return;
+    }
+
+    if (req.get("Heading") && !req.get("Target-Type")) {
+      return this._vaultPatchV2(path, req, res);
+    }
+    return this._vaultPatchV3(path, req, res);
   }
 
   async vaultPatch(req: express.Request, res: express.Response): Promise<void> {
-    const path = req.params[0];
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1)
+    );
 
     return this._vaultPatch(path, req, res);
   }
@@ -401,7 +584,7 @@ export default class RequestHandler {
 
     if (typeof req.body != "string") {
       this.returnCannedResponse(res, {
-        errorCode: ErrorCode.TextOrByteContentEncodingRequired,
+        errorCode: ErrorCode.TextContentEncodingRequired,
       });
       return;
     }
@@ -430,7 +613,9 @@ export default class RequestHandler {
   }
 
   async vaultPost(req: express.Request, res: express.Response): Promise<void> {
-    const path = req.params[0];
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1)
+    );
 
     return this._vaultPost(path, req, res);
   }
@@ -462,7 +647,9 @@ export default class RequestHandler {
     req: express.Request,
     res: express.Response
   ): Promise<void> {
-    const path = req.params[0];
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1)
+    );
 
     return this._vaultDelete(path, req, res);
   }
@@ -789,64 +976,6 @@ export default class RequestHandler {
     res.json(results);
   }
 
-  async searchGuiPost(
-    req: express.Request,
-    res: express.Response
-  ): Promise<void> {
-    const results: SearchResponseItem[] = [];
-    const query: string = req.query.query as string;
-    const contextLength: number =
-      parseInt(req.query.contextLength as string, 10) ?? 100;
-
-    // Open the search panel and start a search
-    this.app.internalPlugins
-      // @ts-ignore
-      .getPluginById("global-search")
-      .instance.openGlobalSearch(query);
-    const searchDom =
-      // @ts-ignore
-      this.app.workspace.getLeavesOfType("search")[0].view.dom;
-
-    // Wait until the search is complete in the UI
-    await new Promise<void>((resolve) => {
-      setTimeout(() => {
-        if (!searchDom.working) {
-          resolve();
-          return;
-        }
-        const interval = setInterval(() => {
-          if (!searchDom.working) {
-            clearInterval(interval);
-            resolve();
-          }
-        }, 2000);
-      }, 100);
-    });
-
-    for (const result of searchDom.children) {
-      const matches: SearchContext[] = [];
-      for (const match of result.result.content) {
-        matches.push({
-          match: {
-            start: match[0],
-            end: match[1],
-          },
-          context: result.content.slice(
-            Math.max(match[0] - contextLength, 0),
-            match[1] + contextLength
-          ),
-        });
-      }
-
-      results.push({
-        filename: result.file.path,
-        matches,
-      });
-    }
-
-    res.json(results);
-  }
-
   valueIsSaneTruthy(value: unknown): boolean {
     if (value === undefined || value === null) {
       return false;
@@ -941,7 +1070,9 @@ export default class RequestHandler {
   }
 
   async openPost(req: express.Request, res: express.Response): Promise<void> {
-    const path = req.params[0];
+    const path = decodeURIComponent(
+      req.path.slice(req.path.indexOf("/", 1) + 1)
+    );
 
     const query = queryString.parseUrl(req.originalUrl, {
       parseBooleans: true,
@@ -981,6 +1112,11 @@ export default class RequestHandler {
     res: express.Response,
     next: express.NextFunction
   ): Promise<void> {
+    if (err.stack) {
+      console.error(err.stack);
+    } else {
+      console.error("No stack available!");
+    }
     if (err instanceof SyntaxError) {
       this.returnCannedResponse(res, {
         errorCode: ErrorCode.InvalidContentForContentType,
@@ -995,12 +1131,18 @@ export default class RequestHandler {
   }
 
   setupRouter() {
+    this.api.use((req, res, next) => {
+      const originalSend = res.send;
+      res.send = function (body, ...args) {
+        console.log(`[REST API] ${req.method} ${req.url} => ${res.statusCode}`);
+
+        return originalSend.apply(res, [body, ...args]);
+      };
+      next();
+    });
     this.api.use(responseTime());
     this.api.use(cors());
     this.api.use(this.authenticationMiddleware.bind(this));
-    this.api.use(
-      bodyParser.text({ type: "text/*", limit: MaximumRequestSize })
-    );
     this.api.use(
       bodyParser.text({
         type: ContentTypes.dataviewDql,
@@ -1023,8 +1165,9 @@ export default class RequestHandler {
       })
     );
     this.api.use(
-      bodyParser.raw({ type: "application/*", limit: MaximumRequestSize })
+      bodyParser.text({ type: "text/*", limit: MaximumRequestSize })
     );
+    this.api.use(bodyParser.raw({ type: "*/*", limit: MaximumRequestSize }));
 
     this.api
       .route("/active/")
@@ -1035,7 +1178,7 @@ export default class RequestHandler {
       .delete(this.activeFileDelete.bind(this));
 
     this.api
-      .route("/vault/(.*)")
+      .route("/vault/*")
       .get(this.vaultGet.bind(this))
       .put(this.vaultPut.bind(this))
       .patch(this.vaultPatch.bind(this))
@@ -1055,12 +1198,13 @@ export default class RequestHandler {
 
     this.api.route("/search/").post(this.searchQueryPost.bind(this));
     this.api.route("/search/simple/").post(this.searchSimplePost.bind(this));
-    this.api.route("/search/gui/").post(this.searchGuiPost.bind(this));
 
-    this.api.route("/open/(.*)").post(this.openPost.bind(this));
+    this.api.route("/open/*").post(this.openPost.bind(this));
 
     this.api.get(`/${CERT_NAME}`, this.certificateGet.bind(this));
     this.api.get("/", this.root.bind(this));
+
+    this.api.use(this.apiExtensionRouter);
 
     this.api.use(this.notFoundHandler.bind(this));
     this.api.use(this.errorHandler.bind(this));
